@@ -32,15 +32,24 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
-          # ---- 1) newest zip anywhere in the repo (by last commit time) ----
-          best=""; best_t=-1
+          # ---- 1) newest zip that really contains an Android project (others are ignored) ----
+          list=$(mktemp)
           while IFS= read -r -d '' z; do
             t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0)
-            t=${t:-0}
-            if [ -z "$best" ] || [ "$t" -gt "$best_t" ] || { [ "$t" -eq "$best_t" ] && [[ "$z" > "$best" ]]; }; then
-              best="$z"; best_t="$t"
-            fi
+            printf '%s\t%s\n' "${t:-0}" "$z" >> "$list"
           done < <(find . -path ./.git -prune -o -path ./_src -prune -o -type f -iname '*.zip' -print0)
+
+          best=""
+          if [ -s "$list" ]; then
+            while IFS=$'\t' read -r t z; do
+              if unzip -Z1 "$z" 2>/dev/null | grep -Eq '(^|/)settings\.gradle(\.kts)?$' \
+                 && unzip -Z1 "$z" 2>/dev/null | grep -Eq '(^|/)app/build\.gradle(\.kts)?$'; then
+                best="$z"; break
+              else
+                echo "Skipping zip (no Android project inside): $z"
+              fi
+            done < <(sort -t$'\t' -k1,1nr -k2,2r "$list")
+          fi
 
           if [ -n "$best" ]; then
             echo "Using zip: $best"
@@ -48,7 +57,7 @@ jobs:
             unzip -q -o "$best" -d _src
             ROOT=_src
           else
-            echo "No zip found - looking for an unzipped project in the repo"
+            echo "No project zip found - looking for an unzipped project in the repo"
             ROOT=.
           fi
 
