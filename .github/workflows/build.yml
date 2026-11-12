@@ -7,39 +7,67 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-apk
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Locate project
+      # Finds the project no matter what the zip is called:
+      # EmployeesApp.zip, EmployeesApp (1).zip ... (20).zip, "anything.zip", etc.
+      # If several zips exist, the most recently uploaded one is built.
+      # If there is no zip, an unzipped project in the repo is built.
+      - name: Locate project (name-independent)
         id: proj
+        shell: bash
         run: |
-          set -e
-          if [ ! -f settings.gradle.kts ] && [ ! -f settings.gradle ]; then
-            ZIP=$(ls ./*.zip 2>/dev/null | head -n 1 || true)
-            if [ -n "$ZIP" ]; then
-              echo "Unzipping $ZIP"
-              mkdir -p _src
-              unzip -q -o "$ZIP" -d _src
+          set -euo pipefail
+          shopt -s nullglob
+
+          # ---- 1) newest zip anywhere in the repo (by last commit time) ----
+          best=""; best_t=-1
+          while IFS= read -r -d '' z; do
+            t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0)
+            t=${t:-0}
+            if [ -z "$best" ] || [ "$t" -gt "$best_t" ] || { [ "$t" -eq "$best_t" ] && [[ "$z" > "$best" ]]; }; then
+              best="$z"; best_t="$t"
             fi
+          done < <(find . -path ./.git -prune -o -path ./_src -prune -o -type f -iname '*.zip' -print0)
+
+          if [ -n "$best" ]; then
+            echo "Using zip: $best"
+            rm -rf _src && mkdir -p _src
+            unzip -q -o "$best" -d _src
+            ROOT=_src
+          else
+            echo "No zip found - looking for an unzipped project in the repo"
+            ROOT=.
           fi
-          SETTINGS=$(find . \( -name settings.gradle.kts -o -name settings.gradle \) | head -n 1)
-          if [ -z "$SETTINGS" ]; then
-            echo "ERROR: settings.gradle.kts not found. Files in repo:"
-            find . -path ./.git -prune -o -type f -print | head -n 80
+
+          # ---- 2) find the Gradle project root (shallowest settings.gradle[.kts] that has an app/ module) ----
+          DIR=""
+          while IFS= read -r s; do
+            d=$(dirname "$s")
+            if [ -d "$d/app" ]; then DIR="$d"; break; fi
+          done < <(find "$ROOT" \( -path '*/.git' -o -path '*/build' -o -path '*/node_modules' -o -path '*/__MACOSX' \) -prune -o \
+                    -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print \
+                    | awk '{print gsub("/","/") " " $0}' | sort -n | cut -d' ' -f2-)
+
+          if [ -z "$DIR" ]; then
+            echo "ERROR: no Android project (settings.gradle + app/) found. Repo files:"
+            find . -path ./.git -prune -o -type f -print | head -n 100
             exit 1
           fi
-          DIR=$(dirname "$SETTINGS")
           echo "Project dir: $DIR"
           ls -la "$DIR"
-          if [ ! -d "$DIR/app" ]; then
-            echo "ERROR: the app folder is missing. Upload EmployeesApp.zip itself to the repo root instead of unzipped files."
-            exit 1
-          fi
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 17
@@ -58,33 +86,31 @@ jobs:
         with:
           gradle-version: 8.7
 
-      - name: Compute version (always higher than the previous build)
+      # versionCode = minutes since 1970, so every new build is higher than the
+      # previous one and Android installs it as an update over the old app.
+      - name: Compute version
         run: |
           echo "VERSION_CODE=$(( $(date +%s) / 60 ))" >> "$GITHUB_ENV"
           echo "VERSION_NAME=1.${{ github.run_number }}" >> "$GITHUB_ENV"
 
-      - name: Build debug APK
+      - name: Build APK
         working-directory: ${{ steps.proj.outputs.dir }}
         run: gradle assembleDebug --no-daemon --console=plain
 
-      - name: Publish APK to Releases (direct download, no zip)
+      # Direct, un-zipped APK in the Releases page.
+      - name: Publish APK to Releases (direct download)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          APK=$(ls "${{ steps.proj.outputs.dir }}"/app/build/outputs/apk/debug/*.apk | head -n 1)
+          APK=$(find "${{ steps.proj.outputs.dir }}/app/build/outputs/apk" -name '*.apk' | head -n 1)
+          [ -n "$APK" ] || { echo "APK not found"; exit 1; }
           cp "$APK" employees.apk
-          gh release create "build-${{ github.run_number }}" employees.apk \
+          TAG="build-${{ github.run_number }}-${{ github.run_attempt }}"
+          gh release create "$TAG" employees.apk \
             --repo "${{ github.repository }}" \
             --title "Employees APK #${{ github.run_number }}" \
-            --notes "Debug build. Download employees.apk and install it." \
+            --notes "Build ${{ github.run_number }}. Download employees.apk and install it (it updates the existing app)." \
             --latest
-
-      - name: Upload APK as artifact (backup, zipped by GitHub)
-        uses: actions/upload-artifact@v4
-        with:
-          name: employees-apk
-          path: ${{ steps.proj.outputs.dir }}/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
 
       - name: Upload build reports on failure
         if: failure()
