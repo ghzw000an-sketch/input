@@ -2,11 +2,10 @@ name: Build APK
 
 on:
   push:
-  pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -15,6 +14,33 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Locate project
+        id: proj
+        run: |
+          set -e
+          if [ ! -f settings.gradle.kts ] && [ ! -f settings.gradle ]; then
+            ZIP=$(ls ./*.zip 2>/dev/null | head -n 1 || true)
+            if [ -n "$ZIP" ]; then
+              echo "Unzipping $ZIP"
+              mkdir -p _src
+              unzip -q -o "$ZIP" -d _src
+            fi
+          fi
+          SETTINGS=$(find . \( -name settings.gradle.kts -o -name settings.gradle \) | head -n 1)
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: settings.gradle.kts not found. Files in repo:"
+            find . -path ./.git -prune -o -type f -print | head -n 80
+            exit 1
+          fi
+          DIR=$(dirname "$SETTINGS")
+          echo "Project dir: $DIR"
+          ls -la "$DIR"
+          if [ ! -d "$DIR/app" ]; then
+            echo "ERROR: the app folder is missing. Upload EmployeesApp.zip itself to the repo root instead of unzipped files."
+            exit 1
+          fi
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -32,14 +58,32 @@ jobs:
         with:
           gradle-version: 8.7
 
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Compute version (always higher than the previous build)
+        run: |
+          echo "VERSION_CODE=$(( $(date +%s) / 60 ))" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=1.${{ github.run_number }}" >> "$GITHUB_ENV"
 
-      - name: Upload APK
+      - name: Build debug APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: gradle assembleDebug --no-daemon --console=plain
+
+      - name: Publish APK to Releases (direct download, no zip)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls "${{ steps.proj.outputs.dir }}"/app/build/outputs/apk/debug/*.apk | head -n 1)
+          cp "$APK" employees.apk
+          gh release create "build-${{ github.run_number }}" employees.apk \
+            --repo "${{ github.repository }}" \
+            --title "Employees APK #${{ github.run_number }}" \
+            --notes "Debug build. Download employees.apk and install it." \
+            --latest
+
+      - name: Upload APK as artifact (backup, zipped by GitHub)
         uses: actions/upload-artifact@v4
         with:
           name: employees-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: ${{ steps.proj.outputs.dir }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
       - name: Upload build reports on failure
@@ -47,7 +91,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-reports
-          path: |
-            app/build/reports
-            build/reports
+          path: ${{ steps.proj.outputs.dir }}/app/build/reports
           if-no-files-found: ignore
