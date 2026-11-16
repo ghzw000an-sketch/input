@@ -1,1 +1,240 @@
+# =====================================================================
+#  بناء APK تلقائي - يعمل مع أي مشروع داخل ملف zip مهما كان اسمه
+#  ضع هذا الملف في:  .github/workflows/build-apk.yml
+#  ثم ارفع ملف الـ zip (أي اسم: name.zip أو name (1).zip ... (20).zip)
+#  النتيجة: ملف APK جاهز للتحميل مباشرة من صفحة Releases (بدون zip)
+# =====================================================================
+name: Build APK (auto)
 
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # 1) البحث عن أحدث ملف zip في المستودع (بأي اسم) وفك ضغطه
+      #    وتحديد نوع المشروع: Flutter أو Android أصلي (Gradle)
+      # ------------------------------------------------------------
+      - name: Detect project
+        id: detect
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/work"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+
+          BEST=""; BEST_T=-1
+          while IFS= read -r -d '' f; do
+            t=$(git log -1 --format=%ct -- "$f" 2>/dev/null || true)
+            t=${t:-0}
+            if [ "$t" -ge "$BEST_T" ]; then BEST="$f"; BEST_T="$t"; fi
+          done < <(find . -type f -iname '*.zip' -not -path './.git/*' -print0)
+
+          if [ -n "$BEST" ]; then
+            echo "Using archive: $BEST"
+            rc=0; unzip -q -o "$BEST" -d "$WORK" || rc=$?
+            if [ "$rc" -gt 1 ]; then echo "::error::Could not extract: $BEST"; exit 1; fi
+            rm -rf "$WORK/__MACOSX"
+          else
+            echo "No zip found - using the repository files directly"
+            tar --exclude=./.git -cf - . | tar -xf - -C "$WORK"
+          fi
+
+          ROOT=""; TYPE=""
+
+          # Flutter: أقرب pubspec.yaml فيه flutter:
+          while IFS= read -r p; do
+            if grep -qE '^flutter:' "$p"; then ROOT=$(dirname "$p"); TYPE=flutter; break; fi
+          done < <(find "$WORK" -maxdepth 5 -name pubspec.yaml -not -path '*/build/*' \
+                   | awk '{n=gsub("/","/"); print n " " $0}' | sort -n | cut -d' ' -f2-)
+
+          # Android أصلي: أقرب settings.gradle
+          if [ -z "$TYPE" ]; then
+            while IFS= read -r p; do
+              ROOT=$(dirname "$p"); TYPE=android; break
+            done < <(find "$WORK" -maxdepth 5 \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/build/*' \
+                     | awk '{n=gsub("/","/"); print n " " $0}' | sort -n | cut -d' ' -f2-)
+          fi
+
+          if [ -z "$TYPE" ]; then
+            echo "::error::No Flutter (pubspec.yaml) or Android (settings.gradle) project found. Files:"
+            find "$WORK" -maxdepth 3 | head -50
+            exit 1
+          fi
+
+          GV=8.9
+          PROP="$ROOT/gradle/wrapper/gradle-wrapper.properties"
+          if [ "$TYPE" = android ] && [ -f "$PROP" ]; then
+            v=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$PROP" | head -1 | sed 's/gradle-//' || true)
+            if [ -n "$v" ]; then GV="$v"; fi
+          fi
+
+          echo "Project type: $TYPE"
+          echo "Project root: $ROOT"
+          echo "Gradle: $GV"
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "gradle_version=$GV" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # 2) Java + Android SDK (قبول التراخيص وتثبيت الأدوات)
+      # ------------------------------------------------------------
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Prepare Android SDK
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then SDKM=$(command -v sdkmanager || true); fi
+          if [ -n "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null || true
+            "$SDKM" "platform-tools" "build-tools;34.0.0" "platforms;android-34" > /dev/null || true
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          ls "$ANDROID_HOME/build-tools" || true
+
+      # ------------------------------------------------------------
+      # 3أ) مشروع Flutter
+      # ------------------------------------------------------------
+      - name: Setup Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          set -euo pipefail
+          NAME=$(grep -m1 -E '^name:' pubspec.yaml | sed -E 's/^name:[[:space:]]*//' | tr -cd 'a-zA-Z0-9_' | tr 'A-Z' 'a-z' || true)
+          NAME=${NAME:-app}
+          if [ ! -d android ]; then
+            flutter create --platforms=android --project-name "$NAME" .
+          elif [ ! -f android/gradle/wrapper/gradle-wrapper.jar ] || [ ! -f android/gradlew ]; then
+            flutter create --platforms=android --project-name "$NAME" "$RUNNER_TEMP/tpl"
+            mkdir -p android/gradle/wrapper
+            cp "$RUNNER_TEMP/tpl/android/gradlew" android/gradlew
+            cp "$RUNNER_TEMP/tpl/android/gradle/wrapper/gradle-wrapper.jar" android/gradle/wrapper/
+            if [ ! -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+              cp "$RUNNER_TEMP/tpl/android/gradle/wrapper/gradle-wrapper.properties" android/gradle/wrapper/
+            fi
+          fi
+          chmod +x android/gradlew || true
+          flutter pub get
+          flutter build apk --release --no-tree-shake-icons
+
+      # ------------------------------------------------------------
+      # 3ب) مشروع Android أصلي (Java / Kotlin)
+      # ------------------------------------------------------------
+      - name: Setup Gradle
+        if: steps.detect.outputs.type == 'android'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.detect.outputs.gradle_version }}
+
+      - name: Build Android APK
+        if: steps.detect.outputs.type == 'android'
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          set -uo pipefail
+          if ! gradle assembleRelease --no-daemon --stacktrace; then
+            echo "::warning::assembleRelease failed, trying assembleDebug"
+            gradle assembleDebug --no-daemon --stacktrace
+          fi
+
+      # ------------------------------------------------------------
+      # 4) مفتاح توقيع ثابت (يُنشأ مرة واحدة ويُحفظ في المستودع)
+      #    التوقيع الصحيح + ثبات المفتاح يمنعان خطأ "الحزمة غير صالحة"
+      # ------------------------------------------------------------
+      - name: Create signing key (first run only)
+        run: |
+          set -uo pipefail
+          if [ ! -f signing/release.jks ]; then
+            mkdir -p signing
+            keytool -genkeypair -keystore signing/release.jks \
+              -storepass android123 -keypass android123 -alias key \
+              -keyalg RSA -keysize 2048 -validity 36500 \
+              -dname "CN=AppBuild, O=AppBuild, C=US"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add signing/release.jks
+            git commit -m "Add signing key (auto-generated)"
+            git pull --rebase origin "$GITHUB_REF_NAME" || true
+            git push origin "HEAD:refs/heads/$GITHUB_REF_NAME" \
+              || echo "::warning::Could not save the key in the repo; next build may use a different key"
+          fi
+
+      # ------------------------------------------------------------
+      # 5) إيجاد ملف APK ثم zipalign + توقيع v1/v2/v3 + تحقق
+      # ------------------------------------------------------------
+      - name: Align and sign APK
+        id: sign
+        env:
+          TYPE: ${{ steps.detect.outputs.type }}
+          ROOT: ${{ steps.detect.outputs.root }}
+          RUN_NO: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          cd "$ROOT"
+          APK=""
+          if [ "$TYPE" = flutter ]; then
+            APK="build/app/outputs/flutter-apk/app-release.apk"
+          else
+            APK=$(find . -type f -path '*/build/outputs/apk/release/*.apk' -print0 | xargs -0 -r ls -S | head -1 || true)
+            if [ -z "$APK" ]; then
+              APK=$(find . -type f -path '*/build/outputs/apk/debug/*.apk' -print0 | xargs -0 -r ls -S | head -1 || true)
+            fi
+          fi
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::error::APK not found after build"; find . -name '*.apk' || true; exit 1
+          fi
+          echo "Built: $APK"
+
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          OUT="$GITHUB_WORKSPACE/App-build-${RUN_NO}.apk"
+          "$BT/zipalign" -f -p 4 "$APK" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$GITHUB_WORKSPACE/signing/release.jks" \
+            --ks-pass pass:android123 --key-pass pass:android123 --ks-key-alias key \
+            --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+            --out "$OUT" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --verbose "$OUT"
+          ls -lh "$OUT"
+          echo "apk=$OUT" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # 6) نشر APK مباشرة في Releases (رابط تحميل مباشر بدون zip)
+      # ------------------------------------------------------------
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          body: "حمّل ملف APK من قسم Assets أدناه ثم ثبّته مباشرة."
+          files: ${{ steps.sign.outputs.apk }}
+          make_latest: true
+
+      - name: Summary
+        run: |
+          echo "### ✅ تم بناء APK" >> "$GITHUB_STEP_SUMMARY"
+          echo "التحميل: https://github.com/${{ github.repository }}/releases/latest" >> "$GITHUB_STEP_SUMMARY"
